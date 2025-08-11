@@ -1,135 +1,73 @@
-use chrono::{DateTime, Datelike, Timelike, Utc};
-use flate2::read::GzDecoder;
-use reqwest::blocking::get;
-use rusqlite::{params, Connection};
-use serde_json::Value;
-use std::io::{self, BufRead};
+use rusqlite::{Connection};
+use std::env;
+use ureq;
+
+mod db;
+mod archive;
+mod filter;
+mod fetch;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Step 1: Connect to SQLite
-    let conn = Connection::open("good_first_issues.db")?;
-    initialize_db(&conn)?;
+    // Get DB path from command line argument or use default
+    let db_path = env::args().nth(1).unwrap_or_else(|| "good_first_issues.db".to_string());
+
+     // Validate the database path
+    if let Err(e) = db::validate_db_path(&db_path) {
+        eprintln!("{}", e);
+        return Ok(());
+    }
+
+
+    // Try to open the database safely
+    let conn = match Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error opening database '{}': {}", db_path, e);
+            return Ok(());
+        }
+    };
+    db::initialize_db(&conn)?;
+
 
     // Step 2: Fetch the list of repositories to monitor
-    let repositories: Vec<String> = conn
+    let _repositories: Vec<String> = conn
         .prepare("SELECT full_name FROM repositories")?
         .query_map([], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
 
-    // Step 3: Determine the most recent GitHub Archive URL
-    let now: DateTime<Utc> = Utc::now();
-    let hour = now.hour();
-    let url = format!(
-        "https://data.gharchive.org/{:04}-{:02}-{:02}-{:02}.json.gz",
-        now.year(),
-        now.month(),
-        now.day(),
-        hour
-    );
+    let (url, archive_key) = archive::current_archive_url_and_key();
 
-    println!("Downloading file from: {}", url);
-
-    let mut url = format!(
-        "https://data.gharchive.org/{:04}-{:02}-{:02}-{:02}.json.gz",
-        now.year(),
-        now.month(),
-        now.day(),
-        hour
-    );
-
-    let mut response = get(&url)?;
-
-    if !response.status().is_success() {
-        // Retry with the previous hour's archive
-        let previous_hour = if hour == 0 { 23 } else { hour - 1 };
-        url = format!(
-            "https://data.gharchive.org/{:04}-{:02}-{:02}-{:02}.json.gz",
-            now.year(),
-            now.month(),
-            now.day(),
-            previous_hour
+    if db::is_archive_processed(&conn, &archive_key)? {
+        println!(
+            "Archive {}.json.gz already processed. Printing issues from DB:\n",
+            archive_key
         );
-        println!("Retrying with previous hour: {}", url);
-        response = get(&url)?;
-    }
-
-    if !response.status().is_success() {
-        eprintln!("Failed to download file: HTTP {}", response.status());
+        db::print_issues_from_db(&conn)?;
         return Ok(());
     }
 
-    println!("Decompressing and filtering issues...");
-    let decoder = GzDecoder::new(response);
-    let buffered = io::BufReader::new(decoder);
+    println!("Downloading file from: {}", url);
 
-    for line in buffered.lines() {
-        let line = line?;
-        let json: Value = serde_json::from_str(&line)?;
+    // Use ureq for HTTP requests
+    let response = ureq::get(&url).call();
 
-        if let Some(repo_name) = json
-            .get("repo")
-            .and_then(|r| r.get("name"))
-            .and_then(|r| r.as_str())
-        {
-            if repositories.contains(&repo_name.to_string()) {
-                if let Some(issue) = json.get("payload").and_then(|payload| payload.get("issue")) {
-                    if let Some(labels) = issue.get("labels") {
-                        if labels
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter().any(|label| {
-                                    label.get("name")
-                                        == Some(&Value::String("good first issue".to_string()))
-                                })
-                            })
-                            .unwrap_or(false)
-                        {
-                            let issue_id = issue.get("id").and_then(|id| id.as_i64()).unwrap_or(0);
-                            let title = issue.get("title").and_then(|t| t.as_str()).unwrap_or("");
-                            let url = issue.get("html_url").and_then(|u| u.as_str()).unwrap_or("");
-                            let created_at = issue
-                                .get("created_at")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("");
-
-                            if let Err(_) = conn.execute(
-                                "INSERT INTO good_first_issues (issue_id, repo_name, title, url, created_at)
-                                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                                params![issue_id, repo_name, title, url, created_at],
-                            ) {
-                                println!("Issue already exists: {}", issue_id);
-                            } else {
-                                println!("New issue added: {} - {}", repo_name, title);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    if response.is_err() {
+        eprintln!("Error fetching data from URL: {}", url);
+        return Ok(());
     }
+    let _response = response.unwrap();
+
+    println!("Decompressing and filtering issues...");
+    let buffered = fetch::download_and_decompress(&url)?;
+    filter::process_issues_from_reader(&conn, buffered)?;
+
+    // After processing and inserting issues, print out all issues in the database
+    println!("\nList of 'good first issues' in the database:");
+    db::print_issues_from_db(&conn)?;
+    // Mark the archive as processed
+    db::mark_archive_processed(&conn, &archive_key)?;
 
     Ok(())
 }
 
-fn initialize_db(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS repositories (
-            id INTEGER PRIMARY KEY,
-            full_name TEXT UNIQUE NOT NULL
-        )",
-        [],
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS good_first_issues (
-            id INTEGER PRIMARY KEY,
-            issue_id INTEGER NOT NULL,
-            repo_name TEXT NOT NULL,
-            title TEXT NOT NULL,
-            url TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE(issue_id)
-        )",
-        [],
-    )?;
-    Ok(())
-}
+
